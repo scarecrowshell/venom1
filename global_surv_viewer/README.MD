@@ -100,36 +100,6 @@ We aim to democratize access to planetary‑scale situational awareness by provi
 
 The application is structured as a single‑page web app (SPA) with a modular, service‑oriented design.
 
-┌─────────────────────────────────────────────────────────────┐
-│ React Frontend (SPA) │
-│ ┌─────────────────┐ ┌──────────────┐ ┌───────────────┐ │
-│ │ Cesium Viewer │ │ Layer Manager│ │ Search / UI │ │
-│ │ Component │ │ (Sidebar) │ │ Components │ │
-│ └────────┬────────┘ └──────┬───────┘ └───────┬───────┘ │
-│ │ │ │ │
-│ ▼ ▼ ▼ │
-
-│ ┌───────────────────────────────────────────────────────┐ │
-│ │ Data Service Abstraction Layer │ │
-│ │ (Handles WMS, WMTS, GeoJSON, 3D Tiles, REST APIs) │ │
-│ └───────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-│
-▼
-
-┌─────────────────────────────────────────────────────────────┐
-│ Backend Aggregation Proxy (Optional) │
-│ • API Key Management • Caching • Rate Limiting │
-│ • Data Format Conversion • 3D Tiles Generation Pipeline │
-└─────────────────────────────────────────────────────────────┘
-│
-▼
-
-┌─────────────────────────────────────────────────────────────┐
-│ External Data Sources │
-│ Cesium ion │ NASA GIBS │ Mapillary │ Sentinel Hub │ OSM │
-└─────────────────────────────────────────────────────────────┘
-
 - **Frontend:** React + TypeScript provides a robust, maintainable UI layer. CesiumJS is integrated via a custom React component that manages the 3D scene lifecycle.
 - **State Management:** React Context or a lightweight state library manages layer visibility, camera position, and user preferences.
 - **Data Services:** A set of TypeScript classes abstract the fetching and rendering of each data source (e.g., `MapillaryService`, `GIBSImageryProvider`).
