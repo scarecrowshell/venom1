@@ -99,6 +99,7 @@ We aim to democratize access to planetary‑scale situational awareness by provi
 ## 🏗️ **Architecture Overview**
 
 The application is structured as a single‑page web app (SPA) with a modular, service‑oriented design.
+
 ┌─────────────────────────────────────────────────────────────┐
 │ React Frontend (SPA) │
 │ ┌─────────────────┐ ┌──────────────┐ ┌───────────────┐ │
@@ -107,6 +108,7 @@ The application is structured as a single‑page web app (SPA) with a modular, s
 │ └────────┬────────┘ └──────┬───────┘ └───────┬───────┘ │
 │ │ │ │ │
 │ ▼ ▼ ▼ │
+
 │ ┌───────────────────────────────────────────────────────┐ │
 │ │ Data Service Abstraction Layer │ │
 │ │ (Handles WMS, WMTS, GeoJSON, 3D Tiles, REST APIs) │ │
@@ -114,6 +116,7 @@ The application is structured as a single‑page web app (SPA) with a modular, s
 └─────────────────────────────────────────────────────────────┘
 │
 ▼
+
 ┌─────────────────────────────────────────────────────────────┐
 │ Backend Aggregation Proxy (Optional) │
 │ • API Key Management • Caching • Rate Limiting │
@@ -121,6 +124,7 @@ The application is structured as a single‑page web app (SPA) with a modular, s
 └─────────────────────────────────────────────────────────────┘
 │
 ▼
+
 ┌─────────────────────────────────────────────────────────────┐
 │ External Data Sources │
 │ Cesium ion │ NASA GIBS │ Mapillary │ Sentinel Hub │ OSM │
