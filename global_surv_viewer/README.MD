@@ -1,4 +1,4 @@
-# GEO-SURVEILLANCE FEED  ·  v0.1
+# GEO-SURVEILLANCE FEED  ·  v0.2
 
 > Public OSINT Edition — Test Build for Kali Linux
 
@@ -19,7 +19,7 @@ http://127.0.0.1:8050
 
 ---
 
-## What's Live in v0.1
+## What's Live in v0.2
 
 | Layer | Source | Notes |
 |---|---|---|
