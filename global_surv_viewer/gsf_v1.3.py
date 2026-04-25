@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════╗
-║   GEO-SURVEILLANCE FEED  ·  VERSION 1.0  — ADVANCED      ║
+║   GEO-SURVEILLANCE FEED  ·  VERSION 1.1  — INTERACTIVE   ║
 ║   Global Vision Platform — Public OSINT Edition           ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  ARCHITECTURE CHANGE:                                     ║
@@ -134,6 +134,13 @@ weight_airqual  = 0.25
 weight_conflict = 0.25
 weight_fire     = 0.15
 grid_deg        = 5
+
+[events]
+# Ticketmaster Discovery API — free, 5000 calls/day
+# Get your key in 60 sec: https://developer.ticketmaster.com/
+ticketmaster_api_key =
+events_radius_km     = 25
+events_max_results   = 30
 """
 
 _CONFIG_FILE = 'gsf.ini'
@@ -162,11 +169,14 @@ def _cf(s, k, fb=0.0):
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 AIS_API_KEY    = os.environ.get('AIS_API_KEY',    _cg('keys','ais_api_key'))
 FIRMS_MAP_KEY  = os.environ.get('FIRMS_MAP_KEY',  _cg('keys','firms_map_key'))
-OPENAQ_API_KEY = os.environ.get('OPENAQ_API_KEY', _cg('keys','openaq_api_key'))
+OPENAQ_API_KEY       = os.environ.get('OPENAQ_API_KEY',       _cg('keys','openaq_api_key'))
+TICKETMASTER_API_KEY = os.environ.get('TICKETMASTER_API_KEY', _cg('events','ticketmaster_api_key'))
+EVENTS_RADIUS_KM     = _ci('events','events_radius_km',   25)
+EVENTS_MAX_RESULTS   = _ci('events','events_max_results',  30)
 HOST = _cg('gsf','host','0.0.0.0')
 PORT = _ci('gsf','port',8050)
 
@@ -759,6 +769,302 @@ WMO_CODES={0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog
     71:'Light snow',73:'Snow',75:'Heavy snow',80:'Light showers',81:'Showers',82:'Heavy showers',
     95:'Thunderstorm',96:'Thunderstorm+hail',99:'Heavy hail'}
 
+# ── POI category → icon/colour map ──────────────────────────
+POI_ICONS = {
+    'restaurant':'🍽', 'cafe':'☕', 'fast_food':'🍟', 'bar':'🍺', 'pub':'🍻',
+    'hospital':'🏥', 'clinic':'🏥', 'pharmacy':'💊', 'doctors':'⚕',
+    'school':'🏫', 'university':'🎓', 'library':'📚',
+    'supermarket':'🛒', 'convenience':'🏪', 'marketplace':'🏪',
+    'fuel':'⛽', 'parking':'🅿', 'bank':'🏦', 'atm':'💳',
+    'hotel':'🏨', 'hostel':'🏨', 'museum':'🏛', 'theatre':'🎭',
+    'cinema':'🎬', 'park':'🌳', 'police':'🚓', 'fire_station':'🚒',
+    'place_of_worship':'⛪', 'post_office':'📮', 'toilets':'🚻',
+    'charging_station':'⚡', 'bicycle_rental':'🚲', 'bus_station':'🚌',
+}
+POI_COLORS = {
+    'restaurant':'#ff8844', 'cafe':'#cc8822', 'fast_food':'#ff6600', 'bar':'#aa5500',
+    'hospital':'#ff4466', 'clinic':'#ff4466', 'pharmacy':'#ff88aa',
+    'school':'#44aaff', 'university':'#2288ff', 'library':'#4488cc',
+    'fuel':'#ffcc00', 'parking':'#888888', 'bank':'#aacc44',
+    'hotel':'#cc88ff', 'museum':'#ff88cc', 'park':'#44cc66',
+    'police':'#0088ff', 'default':'#aaaaaa',
+}
+
+def _poi_color(cat):
+    for k,v in POI_COLORS.items():
+        if k in cat: return v
+    return POI_COLORS['default']
+
+def _poi_icon(cat):
+    for k,v in POI_ICONS.items():
+        if k in cat: return v
+    return '📍'
+
+
+def fetch_overpass_poi(lat, lon, radius_m=3000):
+    """Query OpenStreetMap Overpass API for nearby amenities. Free, no key."""
+    query = f"""
+[out:json][timeout:8];
+(
+  node["amenity"](around:{radius_m},{lat},{lon});
+  node["shop"](around:{radius_m},{lat},{lon});
+  node["tourism"](around:{radius_m},{lat},{lon});
+  node["leisure"]["leisure"!="grass"](around:{radius_m},{lat},{lon});
+);
+out body 300;
+"""
+    try:
+        r = requests.post('https://overpass-api.de/api/interpreter',
+                          data={'data': query}, timeout=10)
+        r.raise_for_status()
+        rows = []
+        for el in r.json().get('elements', []):
+            lat_e = el.get('lat'); lon_e = el.get('lon')
+            if lat_e is None or lon_e is None: continue
+            tags = el.get('tags', {})
+            cat  = (tags.get('amenity') or tags.get('shop') or
+                    tags.get('tourism') or tags.get('leisure') or 'place')
+            name = tags.get('name', cat)[:40]
+            rows.append({'lat':round(float(lat_e),6),'lon':round(float(lon_e),6),
+                         'name':name,'category':cat,
+                         'icon':_poi_icon(cat),'color':_poi_color(cat)})
+        print(f"[POI] {len(rows)} results for ({lat:.3f},{lon:.3f}) r={radius_m}m")
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"[POI] {e}"); return pd.DataFrame()
+
+
+def geocode_location(query: str):
+    """Nominatim geocoder — returns (lat, lon, display_name) or None."""
+    try:
+        r = requests.get('https://nominatim.openstreetmap.org/search',
+                         params={'q': query, 'format': 'json', 'limit': 1},
+                         headers={'Accept-Language': 'en', 'User-Agent': f'GSF/{VERSION}'},
+                         timeout=6)
+        r.raise_for_status()
+        data = r.json()
+        if not data: return None
+        best = data[0]
+        return (round(float(best['lat']), 5),
+                round(float(best['lon']), 5),
+                best.get('display_name', query)[:60])
+    except Exception as e:
+        print(f"[GEOCODE] {e}"); return None
+
+
+# ─────────────────────────────────────────────────────────────
+# EVENT INTELLIGENCE ENGINE  ← v1.2
+# ─────────────────────────────────────────────────────────────
+
+TM_BASE = "https://app.ticketmaster.com/discovery/v2"
+
+# Ticketmaster segment/genre labels → user-readable + emoji
+TM_SEGMENTS = {
+    'KZFzniwnSyZfZ7v7nJ': ('🎵','Music'),
+    'KZFzniwnSyZfZ7v7nE': ('⚽','Sports'),
+    'KZFzniwnSyZfZ7v7na': ('🎨','Arts & Theatre'),
+    'KZFzniwnSyZfZ7v7nn': ('🎡','Miscellaneous'),
+    'KZFzniwnSyZfZ7v7n1': ('🎪','Film & Media'),
+    'KZFzniwnSyZfZ7v7nk': ('🏛','Family'),
+}
+
+def _tm_segment_label(seg_id: str):
+    return TM_SEGMENTS.get(seg_id, ('🎟','Event'))
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two lat/lon points."""
+    R  = 6371.0
+    φ1 = math.radians(lat1); φ2 = math.radians(lat2)
+    Δφ = math.radians(lat2 - lat1)
+    Δλ = math.radians(lon2 - lon1)
+    a  = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def fetch_ticketmaster_events(lat: float, lon: float,
+                              radius_km: int = EVENTS_RADIUS_KM,
+                              size: int = EVENTS_MAX_RESULTS) -> list[dict]:
+    """
+    Query Ticketmaster Discovery API for real upcoming events near a location.
+    Free API key (5000 calls/day): https://developer.ticketmaster.com/
+    Falls back to empty list if no key or API error.
+    """
+    if not TICKETMASTER_API_KEY:
+        return []
+    try:
+        r = requests.get(f"{TM_BASE}/events.json", params={
+            'apikey':    TICKETMASTER_API_KEY,
+            'latlong':   f"{lat},{lon}",
+            'radius':    str(radius_km),
+            'unit':      'km',
+            'size':      str(size),
+            'sort':      'date,asc',
+        }, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get('_embedded', {}).get('events', [])
+        results = []
+        for ev in items:
+            dates = ev.get('dates', {})
+            start = dates.get('start', {})
+            date_str  = start.get('localDate', '')
+            time_str  = start.get('localTime', '')
+            tba       = start.get('timeTBA', False)
+            status    = dates.get('status', {}).get('code', 'onsale')
+            venues    = ev.get('_embedded', {}).get('venues', [{}])
+            venue     = venues[0] if venues else {}
+            v_name    = venue.get('name', 'Unknown Venue')
+            v_city    = venue.get('city', {}).get('name', '')
+            v_country = venue.get('country', {}).get('name', '')
+            v_loc     = venue.get('location', {})
+            v_lat     = float(v_loc.get('latitude',  lat))
+            v_lon     = float(v_loc.get('longitude', lon))
+            seg_id    = ''
+            class_list= ev.get('classifications', [{}])
+            if class_list:
+                seg = class_list[0].get('segment', {})
+                seg_id = seg.get('id', '')
+            icon, label = _tm_segment_label(seg_id)
+            dist = haversine_km(lat, lon, v_lat, v_lon)
+            price_ranges = ev.get('priceRanges', [])
+            price_str = ''
+            if price_ranges:
+                pr = price_ranges[0]
+                cur = pr.get('currency', 'USD')
+                mn  = pr.get('min', 0); mx = pr.get('max', 0)
+                price_str = f"{cur} {mn:.0f}–{mx:.0f}" if mn != mx else f"{cur} {mn:.0f}"
+            time_display = (time_str[:5] if time_str and not tba else 'TBA')
+            results.append({
+                'source':   'ticketmaster',
+                'id':       ev.get('id', ''),
+                'name':     ev.get('name', 'Unknown Event')[:70],
+                'icon':     icon,
+                'category': label,
+                'date':     date_str,
+                'time':     time_display,
+                'datetime_sort': date_str + 'T' + (time_str or '99:99'),
+                'venue':    v_name[:40],
+                'city':     v_city,
+                'country':  v_country,
+                'lat':      v_lat,
+                'lon':      v_lon,
+                'dist_km':  round(dist, 1),
+                'status':   status,
+                'price':    price_str,
+                'url':      ev.get('url', ''),
+            })
+        return sorted(results, key=lambda x: x['datetime_sort'])
+    except Exception as e:
+        print(f"[TM] {e}"); return []
+
+
+def fetch_overpass_events(lat: float, lon: float,
+                          radius_m: int = 20000) -> list[dict]:
+    """
+    Query OpenStreetMap Overpass for event venues, stadiums, theatres,
+    festival grounds, conference centres, etc. No API key needed.
+    """
+    query = f"""
+[out:json][timeout:10];
+(
+  node["amenity"~"events_venue|cinema|theatre|concert_hall|music_venue|conference_centre"](around:{radius_m},{lat},{lon});
+  node["leisure"~"stadium|sports_centre|arena|dance|amusement_arcade"](around:{radius_m},{lat},{lon});
+  node["tourism"~"museum|attraction|theme_park|zoo"](around:{radius_m},{lat},{lon});
+  node["building"~"stadium|arena|exhibition_centre|sports_hall"](around:{radius_m},{lat},{lon});
+  way ["amenity"~"events_venue|theatre|concert_hall|cinema"](around:{radius_m},{lat},{lon});
+  way ["leisure"~"stadium|sports_centre|arena"](around:{radius_m},{lat},{lon});
+);
+out center 80;
+"""
+    try:
+        r = requests.post('https://overpass-api.de/api/interpreter',
+                          data={'data': query}, timeout=12)
+        r.raise_for_status()
+        rows = []
+        seen = set()
+        for el in r.json().get('elements', []):
+            # Ways return centre; nodes return lat/lon directly
+            if el['type'] == 'way':
+                centre = el.get('center', {})
+                v_lat = centre.get('lat'); v_lon = centre.get('lon')
+            else:
+                v_lat = el.get('lat'); v_lon = el.get('lon')
+            if v_lat is None or v_lon is None: continue
+            tags  = el.get('tags', {})
+            name  = tags.get('name', '')
+            if not name or name in seen: continue
+            seen.add(name)
+            cat_raw = (tags.get('amenity') or tags.get('leisure') or
+                       tags.get('tourism') or tags.get('building') or 'venue')
+            cat_map = {
+                'theatre':'🎭 Theatre','cinema':'🎬 Cinema','concert_hall':'🎵 Concert Hall',
+                'music_venue':'🎵 Music Venue','events_venue':'🎪 Event Venue',
+                'conference_centre':'🏛 Conference','stadium':'🏟 Stadium',
+                'sports_centre':'⚽ Sports Centre','arena':'🏟 Arena',
+                'museum':'🏛 Museum','attraction':'🌟 Attraction',
+                'theme_park':'🎡 Theme Park','zoo':'🐾 Zoo',
+                'dance':'💃 Dance','amusement_arcade':'🎮 Arcade',
+            }
+            icon_label = cat_map.get(cat_raw, '🏢 Venue')
+            icon, label = icon_label.split(' ', 1)
+            dist = haversine_km(lat, lon, float(v_lat), float(v_lon))
+            rows.append({
+                'source':   'osm_venue',
+                'id':       f"osm-{el['id']}",
+                'name':     name[:60],
+                'icon':     icon,
+                'category': label,
+                'date':     '',
+                'time':     '',
+                'datetime_sort': 'VENUE',
+                'venue':    name[:40],
+                'city':     tags.get('addr:city', ''),
+                'country':  tags.get('addr:country', ''),
+                'lat':      float(v_lat),
+                'lon':      float(v_lon),
+                'dist_km':  round(dist, 1),
+                'status':   'venue',
+                'price':    '',
+                'url':      tags.get('website', tags.get('contact:website', '')),
+            })
+        return sorted(rows, key=lambda x: x['dist_km'])
+    except Exception as e:
+        print(f"[OSM events] {e}"); return []
+
+
+def nearby_gdelt_context(lat: float, lon: float,
+                          radius_km: float,
+                          df_ev: pd.DataFrame) -> list[dict]:
+    """
+    Filter the cached GDELT events DataFrame to those within radius_km
+    of the given point. Returns list of dicts sorted by article count desc.
+    """
+    if df_ev.empty or 'lat' not in df_ev.columns:
+        return []
+    results = []
+    for _, row in df_ev.iterrows():
+        dist = haversine_km(lat, lon, float(row['lat']), float(row['lon']))
+        if dist <= radius_km:
+            tone = float(row.get('tone', 0))
+            # Simple sentiment label
+            if tone < -10:     sentiment = '🔴 Negative'
+            elif tone < -3:    sentiment = '🟠 Concerning'
+            elif tone > 3:     sentiment = '🟢 Positive'
+            else:              sentiment = '🟡 Neutral'
+            results.append({
+                'title':     str(row.get('title', 'News'))[:80],
+                'count':     int(row.get('count', 1)),
+                'tone':      round(tone, 1),
+                'sentiment': sentiment,
+                'dist_km':   round(dist, 1),
+                'lat':       float(row['lat']),
+                'lon':       float(row['lon']),
+                'url':       str(row.get('url', '')),
+            })
+    return sorted(results, key=lambda x: x['count'], reverse=True)[:20]
+
+
 # ─────────────────────────────────────────────────────────────
 # DATA CACHE
 # ─────────────────────────────────────────────────────────────
@@ -1140,6 +1446,7 @@ def route_api_index():
         'anomaly':     f'{base}/api/v1/anomaly',
         'iss_position':f'{base}/api/v1/iss/position',
         'iss_passes':  f'{base}/api/v1/iss/passes?lat=48.85&lon=2.35&n=5',
+        'events':      f'{base}/api/v1/events?lat=48.85&lon=2.35&radius_km=25',
         'frames_list': f'{base}/api/frames/list',
         'frame':       f'{base}/api/frame/{{idx}}',
         'export':      f'{base}/api/export.geojson',
@@ -1147,6 +1454,35 @@ def route_api_index():
         'health':      f'{base}/healthz',
         'metrics':     f'{base}/metrics',
     }}))
+
+@app.server.route('/api/v1/events')
+def route_v1_events():
+    """
+    Nearby event intelligence endpoint.
+    Query params: lat, lon, radius_km (default 25), source (all|ticketmaster|osm|gdelt)
+    """
+    try:
+        lat       = float(flask_request.args.get('lat', 0))
+        lon       = float(flask_request.args.get('lon', 0))
+        radius_km = int(flask_request.args.get('radius_km', EVENTS_RADIUS_KM))
+        source    = flask_request.args.get('source', 'all')
+
+        result = {'lat': lat, 'lon': lon, 'radius_km': radius_km,
+                  'ts': datetime.utcnow().isoformat()+'Z'}
+
+        if source in ('all', 'ticketmaster'):
+            result['ticketmaster_events'] = fetch_ticketmaster_events(lat, lon, radius_km)
+
+        if source in ('all', 'osm'):
+            result['osm_venues'] = fetch_overpass_events(lat, lon, radius_km * 1000)
+
+        if source in ('all', 'gdelt'):
+            df_ev = _cache.get_events()
+            result['gdelt_news_context'] = nearby_gdelt_context(lat, lon, radius_km, df_ev)
+
+        return _cors(jsonify(result))
+    except Exception as e:
+        return _cors(jsonify({'error': str(e)})), 400
 
 @app.server.route('/api/v1/snapshot')
 def route_v1_snap():
@@ -1289,6 +1625,46 @@ body{background:#040c06!important;font-family:'Courier New',monospace}
 .anom-block.anom{background:rgba(40,15,0,.8);color:#ff8844;border:1px solid #884400}
 .gf-row{border-bottom:1px solid #0b2e18;padding:2px 0;font-size:.62rem;display:flex;align-items:center;gap:5px}
 .blink{animation:blink 1.1s step-end infinite}@keyframes blink{50%{opacity:0}}
+/* v1.1 additions */
+.bm-btn{font-family:'Courier New',monospace;background:rgba(0,18,8,.88);border:1px solid #0d3320;
+        color:#224433;font-size:.6rem;padding:2px 8px;border-radius:3px;cursor:pointer;transition:all .12s;
+        margin-right:3px}
+.bm-btn:hover{border-color:#005522;color:#009944}
+.bm-btn.bm-active{border-color:#00cc66;color:#00ff88;background:rgba(0,30,15,.9)}
+.draw-btn{font-family:'Courier New',monospace;background:rgba(0,18,8,.88);border:1px solid #0d3320;
+          color:#336644;font-size:.62rem;padding:3px 8px;border-radius:3px;cursor:pointer;transition:all .12s;width:100%}
+.draw-btn:hover{border-color:#005522;color:#009944}
+.draw-btn.draw-active{border-color:#ffcc00;color:#ffee44;background:rgba(30,20,0,.9);animation:draw-pulse 1s step-end infinite}
+@keyframes draw-pulse{50%{border-color:#886600;color:#ccaa00}}
+.search-result-label{color:#00ff88;font-size:.62rem;padding:2px 4px;
+                     background:rgba(0,30,10,.85);border-radius:2px;margin-top:2px;display:inline-block}
+.poi-badge{display:inline-flex;align-items:center;gap:3px;background:rgba(0,20,40,.85);
+           border:1px solid #0d3355;border-radius:3px;padding:2px 6px;
+           font-size:.6rem;color:#88aaff;margin:1px}
+/* v1.2 Event Intelligence */
+.ev-card{border-bottom:1px solid #1a0030;padding:5px 0;font-size:.63rem}
+.ev-card:last-child{border-bottom:none}
+.ev-name{color:#cc88ff;font-weight:bold;font-size:.65rem;line-height:1.3}
+.ev-meta{color:#664488;font-size:.59rem;margin-top:1px}
+.ev-date{color:#88aaff;font-size:.61rem;font-weight:bold;min-width:70px;flex-shrink:0}
+.ev-dist{color:#336644;font-size:.58rem;white-space:nowrap}
+.ev-badge{display:inline-block;padding:1px 5px;border-radius:2px;font-size:.58rem;
+          font-weight:bold;margin-left:4px}
+.ev-badge.onsale{background:rgba(0,180,50,.2);color:#44dd66;border:1px solid #226633}
+.ev-badge.cancelled{background:rgba(180,0,0,.2);color:#ff4444;border:1px solid #662222}
+.ev-badge.postponed{background:rgba(180,100,0,.2);color:#ffaa44;border:1px solid #664422}
+.ev-badge.sold-out{background:rgba(80,0,80,.2);color:#cc44ff;border:1px solid #442266}
+.ev-badge.venue{background:rgba(0,40,80,.3);color:#4488ff;border:1px solid #224466}
+.ev-price{color:#aaff88;font-size:.6rem;margin-left:4px}
+.ev-link{color:#5d3d8a;font-size:.58rem;text-decoration:none}
+.ev-link:hover{color:#cc88ff}
+.ev-news-item{border-bottom:1px solid #1a0030;padding:4px 0;font-size:.62rem}
+.ev-news-title{color:#ccaaff;line-height:1.3}
+.ev-news-meta{color:#443366;font-size:.58rem;margin-top:1px}
+.ev-section-hdr{color:#5d2d8a;font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;
+                padding:3px 0;border-bottom:1px solid #1a0030;margin-bottom:4px}
+.ev-empty{color:#332244;font-size:.65rem;padding:12px 6px;text-align:center}
+.ev-tm-note{color:#442244;font-size:.58rem;padding:3px 0}
 """
 
 LAYER_OPTIONS=[
@@ -1297,7 +1673,8 @@ LAYER_OPTIONS=[
     {'label':' 🛰','value':'starlink'},{'label':' 🛸','value':'iss'},
     {'label':' 💨','value':'aq'},      {'label':' 📰','value':'events'},
     {'label':' 🎯','value':'threat'},  {'label':' 🔲','value':'geofence'},
-    {'label':' 🛤','value':'trails'},
+    {'label':' 🛤','value':'trails'},  {'label':' 🏙','value':'poi'},
+    {'label':' 🌧','value':'radar'},
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -1355,11 +1732,40 @@ app.layout = html.Div([
                             ],width=5),
                             dbc.Col([
                                 dbc.Checklist(id='layer-toggles',options=LAYER_OPTIONS,
-                                    value=['flights','quakes','fires','ships','starlink','iss','aq','events','threat','geofence','trails'],
+                                    value=['flights','quakes','fires','ships','starlink','iss','aq','events','threat','geofence','trails','radar'],
                                     inline=True,className='layer-check',
                                     style={'marginTop':'4px','fontSize':'.58rem'}),
                             ],width=7),
                         ],align='center'),
+                        # ── Search + Basemap row ────────────────────────
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.InputGroup([
+                                    dbc.Input(id='search-input',
+                                              placeholder="Search location… (city, address, landmark)",
+                                              type='text', debounce=False,
+                                              style={'background':'#040e06','border':'1px solid #0b2e18',
+                                                     'color':'#a0ffcc','fontSize':'.65rem',
+                                                     'fontFamily':'monospace','height':'28px'}),
+                                    dbc.Button("⌕", id='search-btn', n_clicks=0,
+                                               style={'background':'rgba(0,30,15,.9)','border':'1px solid #0d5530',
+                                                      'color':'#00cc66','fontSize':'.7rem','padding':'0 10px',
+                                                      'height':'28px'}),
+                                ], size='sm'),
+                            ], width=6),
+                            dbc.Col([
+                                html.Div([
+                                    html.Span("BASE: ", style={'color':'#336644','fontSize':'.6rem','marginRight':'4px'}),
+                                    html.Button("DARK",   id='bm-dark',   n_clicks=0, className='bm-btn bm-active'),
+                                    html.Button("LIGHT",  id='bm-light',  n_clicks=0, className='bm-btn'),
+                                    html.Button("STREET", id='bm-street', n_clicks=0, className='bm-btn'),
+                                    html.Span("  🌧", id='radar-badge',
+                                              style={'color':'#224433','fontSize':'.65rem','marginLeft':'6px',
+                                                     'cursor':'default'}),
+                                ], style={'display':'flex','alignItems':'center','height':'28px'}),
+                            ], width=6),
+                        ], className='mt-1 mb-0 g-1',
+                           style={'padding':'0 4px 4px 4px'}),
                     ]),
                     dbc.CardBody([
                         # Primary: tile map (Scattermapbox)
@@ -1513,7 +1919,20 @@ app.layout = html.Div([
                     dbc.CardHeader("🔲 GEOFENCE ZONES"),
                     dbc.CardBody([
                         html.Div(id='gf-zone-list',style={'maxHeight':'8vh','overflowY':'auto','fontSize':'.62rem','marginBottom':'5px'}),
-                        dbc.Input(id='gf-name',placeholder="Zone name…",type='text',
+                        # Draw mode row
+                        dbc.Row([
+                            dbc.Col([
+                                html.Button("✏️ DRAW ON MAP", id='gf-draw-toggle', n_clicks=0,
+                                            className='draw-btn',
+                                            style={'width':'100%','fontSize':'.62rem','padding':'4px 6px'}),
+                            ], width=6),
+                            dbc.Col([
+                                html.Div(id='gf-draw-status',
+                                         style={'color':'#336644','fontSize':'.6rem',
+                                                'display':'flex','alignItems':'center','height':'100%'}),
+                            ], width=6),
+                        ], className='g-1 mb-2'),
+                        dbc.Input(id='gf-name',placeholder="Zone name (or type + click map to draw)…",type='text',
                             style={'background':'#040e06','border':'1px solid #0b2e18','color':'#a0ffcc','fontSize':'.6rem','fontFamily':'monospace','marginBottom':'4px'}),
                         dbc.Row([
                             dbc.Col([dbc.Input(id='gf-lat-min',placeholder="Lat min",type='number',style={'background':'#040e06','border':'1px solid #0b2e18','color':'#a0ffcc','fontSize':'.59rem'})],width=3),
@@ -1527,6 +1946,108 @@ app.layout = html.Div([
                         dcc.Interval(id='tick-gf',interval=UI_REFRESH_MS,n_intervals=0),
                     ],style={'padding':'8px','backgroundColor':'#040c06'}),
                 ],className='mb-2'),
+
+                # POI panel
+                dbc.Card([
+                    dbc.CardHeader("🏙 POINTS OF INTEREST  ·  OVERPASS / OSM"),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Input(id='poi-center-input',
+                                          placeholder="City / address to load POIs…",
+                                          type='text', debounce=False,
+                                          style={'background':'#040e06','border':'1px solid #0b2e18',
+                                                 'color':'#a0ffcc','fontSize':'.62rem','fontFamily':'monospace'}),
+                            ], width=8),
+                            dbc.Col([
+                                dbc.Button("LOAD POI", id='poi-load-btn', n_clicks=0,
+                                           style={'fontSize':'.62rem','background':'rgba(0,20,30,.9)',
+                                                  'border':'1px solid #0d3355','color':'#44aaff',
+                                                  'padding':'4px 8px','width':'100%'}),
+                            ], width=4),
+                        ], className='g-1 mb-1'),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Select(id='poi-radius-select',
+                                           options=[{'label':'500 m','value':'500'},
+                                                    {'label':'1 km', 'value':'1000'},
+                                                    {'label':'2 km', 'value':'2000'},
+                                                    {'label':'5 km', 'value':'5000'}],
+                                           value='2000',
+                                           style={'background':'#040e06','border':'1px solid #0b2e18',
+                                                  'color':'#a0ffcc','fontSize':'.61rem'}),
+                            ], width=5),
+                            dbc.Col([
+                                html.Div(id='poi-status',
+                                         style={'color':'#336644','fontSize':'.6rem',
+                                                'display':'flex','alignItems':'center','height':'100%'}),
+                            ], width=7),
+                        ], className='g-1'),
+                    ],style={'padding':'8px','backgroundColor':'#040c06'}),
+                ],className='mb-2'),
+
+                # ── EVENT INTELLIGENCE  ← v1.2 ───────────────────
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.Span("🎟 EVENT INTELLIGENCE  ·  NEARBY EVENTS & VENUES"),
+                    ]),
+                    dbc.CardBody([
+                        # Search row
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Input(id='ev-search-input',
+                                          placeholder="City / address…",
+                                          type='text', debounce=False,
+                                          style={'background':'#040e06','border':'1px solid #0b2e18',
+                                                 'color':'#a0ffcc','fontSize':'.62rem','fontFamily':'monospace'}),
+                            ], width=6),
+                            dbc.Col([
+                                dbc.Select(id='ev-radius-select',
+                                           options=[{'label':'5 km','value':'5'},
+                                                    {'label':'15 km','value':'15'},
+                                                    {'label':'25 km','value':'25'},
+                                                    {'label':'50 km','value':'50'},
+                                                    {'label':'100 km','value':'100'}],
+                                           value='25',
+                                           style={'background':'#040e06','border':'1px solid #0b2e18',
+                                                  'color':'#a0ffcc','fontSize':'.61rem'}),
+                            ], width=3),
+                            dbc.Col([
+                                dbc.Button("SEARCH", id='ev-search-btn', n_clicks=0,
+                                           style={'fontSize':'.62rem','background':'rgba(20,0,30,.9)',
+                                                  'border':'1px solid #5d2d8a','color':'#cc88ff',
+                                                  'padding':'4px 8px','width':'100%'}),
+                            ], width=3),
+                        ], className='g-1 mb-2'),
+
+                        # Tab pills
+                        dbc.Tabs([
+                            dbc.Tab(label="🎫 LIVE EVENTS", tab_id='ev-tab-events',
+                                    label_style={'color':'#5d2d8a','fontSize':'.63rem'},
+                                    active_label_style={'color':'#cc88ff'}),
+                            dbc.Tab(label="🏟 VENUES", tab_id='ev-tab-venues',
+                                    label_style={'color':'#5d2d8a','fontSize':'.63rem'},
+                                    active_label_style={'color':'#cc88ff'}),
+                            dbc.Tab(label="📰 NEWS CONTEXT", tab_id='ev-tab-news',
+                                    label_style={'color':'#5d2d8a','fontSize':'.63rem'},
+                                    active_label_style={'color':'#ffaacc'}),
+                        ], id='ev-tabs', active_tab='ev-tab-events',
+                           style={'background':'transparent','borderBottom':'1px solid #1a0030','marginBottom':'6px'}),
+
+                        # Status line
+                        html.Div(id='ev-status',
+                                 style={'color':'#5d2d8a','fontSize':'.6rem','marginBottom':'4px'}),
+
+                        # Results panel
+                        html.Div(id='ev-results-panel',
+                                 style={'height':'22vh','overflowY':'auto',
+                                        'fontSize':'.63rem','fontFamily':'monospace'}),
+
+                        # Ticketmaster key notice
+                        html.Div(id='ev-key-notice',
+                                 style={'color':'#442244','fontSize':'.58rem','marginTop':'4px'}),
+                    ], style={'padding':'8px','backgroundColor':'#040c06'}),
+                ], className='mb-2'),
 
                 # Telemetry charts
                 dbc.Card([
@@ -1543,7 +2064,7 @@ app.layout = html.Div([
                 dbc.Card([
                     dbc.CardHeader("🎯 THREAT LEADERBOARD"),
                     dbc.CardBody([
-                        html.Div(id='threat-panel',style={'height':'16vh','overflowY':'auto','fontSize':'.62rem','fontFamily':'monospace'}),
+                        html.Div(id='threat-panel',style={'height':'12vh','overflowY':'auto','fontSize':'.62rem','fontFamily':'monospace'}),
                         dcc.Interval(id='tick-threat',interval=UI_REFRESH_MS,n_intervals=0),
                     ],style={'padding':'6px','backgroundColor':'#040c06'}),
                 ]),
@@ -1551,15 +2072,20 @@ app.layout = html.Div([
         ]),
 
         dbc.Row([dbc.Col(html.Div(
-            f"GSF v{VERSION} Advanced  ·  2D Tile Map (Scattermapbox, CartoDB)  ·  "
-            f"v1.0 Advanced  ·  Anomaly Detection  ·  Geofencing  ·  Convergence  ·  ISS Passes  ·  "
-            f"Config: gsf.ini  ·  API: /api/v1/  ·  /healthz  ·  /metrics  ·  Gunicorn WSGI",
+            f"GSF v{VERSION}  ·  2D Tile Map  ·  Event Intelligence (Ticketmaster+OSM)  ·  "
+            f"Anomaly Detection  ·  Geofencing  ·  Convergence  ·  ISS Passes  ·  "
+            f"Config: gsf.ini  ·  API: /api/v1/  ·  /healthz  ·  /metrics",
             style={'color':'#183322','fontSize':'.5rem','padding':'4px 0','textAlign':'center'},
         ))]),
     ]),
 
     dcc.Store(id='store-snap'),
     dcc.Store(id='store-pb'),
+    dcc.Store(id='store-basemap', data='carto-darkmatter'),
+    dcc.Store(id='store-search',  data={'lat': 20.0, 'lon': 0.0, 'zoom': 1.5, 'label': ''}),
+    dcc.Store(id='store-poi',     data=[]),
+    dcc.Store(id='store-draw',    data={'active': False, 'clicks': []}),
+    dcc.Store(id='store-events',  data={'events': [], 'venues': [], 'news': [], 'centre': {}}),
 ])
 
 # ─────────────────────────────────────────────────────────────
@@ -1652,209 +2178,722 @@ def cb_alerts(n):
                              className=f"alert-row {a['severity']}") for a in alerts[:12]]
     return (f"({count})" if count else ""), children
 
-# ── PRIMARY: TILE MAP (Scattermapbox) ────────────────────────
+# ── BASEMAP SWITCHER ─────────────────────────────────────────
+BASEMAP_STYLES = {
+    'dark':   'carto-darkmatter',
+    'light':  'carto-positron',
+    'street': 'open-street-map',
+}
+
+@app.callback(
+    Output('store-basemap','data'),
+    Output('bm-dark','className'),
+    Output('bm-light','className'),
+    Output('bm-street','className'),
+    Input('bm-dark','n_clicks'),
+    Input('bm-light','n_clicks'),
+    Input('bm-street','n_clicks'),
+    State('store-basemap','data'),
+    prevent_initial_call=False,
+)
+def cb_basemap(n_dark, n_light, n_street, current):
+    triggered = ctx.triggered_id
+    mapping = {
+        'bm-dark':   'carto-darkmatter',
+        'bm-light':  'carto-positron',
+        'bm-street': 'open-street-map',
+    }
+    chosen = mapping.get(triggered, current or 'carto-darkmatter')
+    def cls(key):
+        return 'bm-btn bm-active' if mapping[key] == chosen else 'bm-btn'
+    return chosen, cls('bm-dark'), cls('bm-light'), cls('bm-street')
+
+
+# ── SEARCH / FLY-TO ──────────────────────────────────────────
+@app.callback(
+    Output('store-search','data'),
+    Output('search-input','style'),
+    Input('search-btn','n_clicks'),
+    Input('search-input','n_submit'),
+    State('search-input','value'),
+    State('store-search','data'),
+    prevent_initial_call=True,
+)
+def cb_search(n_click, n_submit, query, current):
+    base_style = {'background':'#040e06','border':'1px solid #0b2e18',
+                  'color':'#a0ffcc','fontSize':'.65rem','fontFamily':'monospace','height':'28px'}
+    if not query or not query.strip():
+        return current or {}, base_style
+    result = geocode_location(query.strip())
+    if result is None:
+        err_style = dict(base_style, border='1px solid #882200', color='#ff8866')
+        return current or {}, err_style
+    lat, lon, label = result
+    ok_style = dict(base_style, border='1px solid #00aa44')
+    return {'lat': lat, 'lon': lon, 'zoom': 11, 'label': label}, ok_style
+
+
+# ── GEOFENCE DRAW MODE ────────────────────────────────────────
+@app.callback(
+    Output('store-draw','data'),
+    Output('gf-draw-toggle','className'),
+    Output('gf-draw-status','children'),
+    Output('gf-lat-min','value'),
+    Output('gf-lat-max','value'),
+    Output('gf-lon-min','value'),
+    Output('gf-lon-max','value'),
+    Input('gf-draw-toggle','n_clicks'),
+    Input('map-fig','clickData'),
+    State('store-draw','data'),
+    State('gf-lat-min','value'),
+    State('gf-lat-max','value'),
+    State('gf-lon-min','value'),
+    State('gf-lon-max','value'),
+    prevent_initial_call=True,
+)
+def cb_gf_draw(n_toggle, map_click, draw_state, lat_min, lat_max, lon_min, lon_max):
+    draw = draw_state or {'active': False, 'clicks': []}
+    triggered = ctx.triggered_id
+
+    if triggered == 'gf-draw-toggle':
+        # Toggle draw mode on/off
+        new_active = not draw.get('active', False)
+        new_state = {'active': new_active, 'clicks': []}
+        btn_cls = 'draw-btn draw-active' if new_active else 'draw-btn'
+        status = "🟡 Click corner 1 on the map…" if new_active else ""
+        return new_state, btn_cls, status, lat_min, lat_max, lon_min, lon_max
+
+    if triggered == 'map-fig' and draw.get('active') and map_click:
+        pt  = map_click['points'][0]
+        lat = pt.get('lat'); lon = pt.get('lon')
+        if lat is None or lon is None:
+            return draw, 'draw-btn draw-active', "⚠ Click a map area (not a marker)", lat_min, lat_max, lon_min, lon_max
+
+        clicks = list(draw.get('clicks', []))
+        clicks.append({'lat': float(lat), 'lon': float(lon)})
+
+        if len(clicks) == 1:
+            new_state = {'active': True, 'clicks': clicks}
+            status = f"🟠 Corner 1: ({lat:.3f}, {lon:.3f}) — click corner 2"
+            return new_state, 'draw-btn draw-active', status, lat_min, lat_max, lon_min, lon_max
+        else:
+            # Two clicks — populate the form fields
+            c1, c2 = clicks[0], clicks[1]
+            new_lat_min = round(min(c1['lat'], c2['lat']), 4)
+            new_lat_max = round(max(c1['lat'], c2['lat']), 4)
+            new_lon_min = round(min(c1['lon'], c2['lon']), 4)
+            new_lon_max = round(max(c1['lon'], c2['lon']), 4)
+            new_state = {'active': False, 'clicks': []}
+            status = f"✅ Box ready — name it and click ADD ZONE"
+            return new_state, 'draw-btn', status, new_lat_min, new_lat_max, new_lon_min, new_lon_max
+
+    return draw, ('draw-btn draw-active' if draw.get('active') else 'draw-btn'), "", lat_min, lat_max, lon_min, lon_max
+
+
+# ── POI LOADER ────────────────────────────────────────────────
+@app.callback(
+    Output('store-poi','data'),
+    Output('poi-status','children'),
+    Input('poi-load-btn','n_clicks'),
+    State('poi-center-input','value'),
+    State('poi-radius-select','value'),
+    State('store-search','data'),
+    prevent_initial_call=True,
+)
+def cb_poi_load(n, query, radius, search_state):
+    if not n:
+        return [], ""
+    # Determine centre: use search store if available and no new query
+    if query and query.strip():
+        result = geocode_location(query.strip())
+        if result is None:
+            return [], "✗ Location not found"
+        lat, lon, label = result
+    elif search_state and search_state.get('lat'):
+        lat  = search_state['lat']
+        lon  = search_state['lon']
+        label = search_state.get('label', f"{lat:.3f},{lon:.3f}")
+    else:
+        return [], "⚠ Enter a location or search first"
+
+    radius_m = int(radius or 2000)
+    df = fetch_overpass_poi(lat, lon, radius_m)
+    if df.empty:
+        return [], f"No POI found within {radius_m}m"
+
+    status = html.Span([
+        html.Span(f"✓ {len(df)} POIs", style={'color':'#44aaff','fontWeight':'bold'}),
+        html.Span(f" near {label[:30]}", style={'color':'#336644'}),
+    ])
+    return df.to_dict('records'), status
+
+
+# ── RADAR BADGE UPDATE ────────────────────────────────────────
+@app.callback(
+    Output('radar-badge','style'),
+    Input('layer-toggles','value'),
+)
+def cb_radar_badge(layers):
+    active = 'radar' in (layers or [])
+    return {'color': '#44aaff' if active else '#224433',
+            'fontSize': '.65rem', 'marginLeft': '6px', 'cursor': 'default',
+            'fontWeight': 'bold' if active else 'normal'}
+
+
+# ── EVENT INTELLIGENCE CALLBACK  ← v1.2 ──────────────────────
+@app.callback(
+    Output('store-events','data'),
+    Output('ev-status','children'),
+    Output('ev-key-notice','children'),
+    Input('ev-search-btn','n_clicks'),
+    Input('ev-search-input','n_submit'),
+    State('ev-search-input','value'),
+    State('ev-radius-select','value'),
+    State('store-search','data'),
+    State('store-snap','data'),
+    prevent_initial_call=True,
+)
+def cb_ev_search(n_click, n_submit, query, radius, search_state, snap):
+    radius_km = int(radius or 25)
+
+    # Resolve centre point
+    if query and query.strip():
+        result = geocode_location(query.strip())
+        if result is None:
+            return ({'events':[], 'venues':[], 'news':[], 'centre':{}},
+                    html.Span("✗ Location not found", style={'color':'#ff4444'}), "")
+        lat, lon, label = result
+    elif search_state and search_state.get('lat'):
+        lat   = search_state['lat']
+        lon   = search_state['lon']
+        label = search_state.get('label', f"{lat:.3f},{lon:.3f}")
+    else:
+        return ({'events':[], 'venues':[], 'news':[], 'centre':{}},
+                html.Span("⚠ Enter a location or use the map search first",
+                          style={'color':'#886600'}), "")
+
+    # 1. Live events from Ticketmaster (if key set)
+    tm_events = fetch_ticketmaster_events(lat, lon, radius_km=radius_km)
+
+    # 2. Venue discovery from OSM (always available)
+    osm_venues = fetch_overpass_events(lat, lon, radius_m=radius_km * 1000)
+
+    # 3. GDELT news context from cached data
+    try:
+        df_ev = pd.DataFrame((snap or {}).get('events', []))
+    except Exception:
+        df_ev = pd.DataFrame()
+    news_ctx = nearby_gdelt_context(lat, lon, radius_km, df_ev)
+
+    store = {
+        'events':  tm_events,
+        'venues':  osm_venues,
+        'news':    news_ctx,
+        'centre':  {'lat': lat, 'lon': lon, 'label': label, 'radius_km': radius_km},
+    }
+
+    n_ev = len(tm_events); n_ve = len(osm_venues); n_nw = len(news_ctx)
+    status = html.Div([
+        html.Span(f"📍 {label[:35]}  ·  {radius_km} km radius  —  ",
+                  style={'color':'#664488'}),
+        html.Span(f"🎫 {n_ev} live events  ", style={'color':'#cc88ff','fontWeight':'bold'}),
+        html.Span(f"🏟 {n_ve} venues  ", style={'color':'#4488ff'}),
+        html.Span(f"📰 {n_nw} news items", style={'color':'#ffaacc'}),
+    ])
+
+    key_notice = ""
+    if not TICKETMASTER_API_KEY:
+        key_notice = html.Div([
+            html.Span("🔑 No Ticketmaster key — showing OSM venues only. "
+                      "Get a free key (5000 calls/day) at: "),
+            html.A("developer.ticketmaster.com",
+                   href="https://developer.ticketmaster.com/",
+                   target="_blank",
+                   className='ev-link'),
+            html.Span(" → add to gsf.ini [events] section."),
+        ], className='ev-tm-note')
+
+    return store, status, key_notice
+
+
+@app.callback(
+    Output('ev-results-panel','children'),
+    Input('store-events','data'),
+    Input('ev-tabs','active_tab'),
+)
+def cb_ev_results(store, active_tab):
+    store = store or {}
+    centre = store.get('centre', {})
+
+    if not centre:
+        return html.Div([
+            html.Div("🎟", style={'fontSize':'2rem','marginBottom':'8px','color':'#2a0040'}),
+            html.Div("Search a location to discover nearby events, venues, and news context.",
+                     style={'color':'#443355','fontSize':'.65rem','lineHeight':'1.5'}),
+        ], className='ev-empty')
+
+    # ── Tab: Live Events ──────────────────────────────────────
+    if active_tab == 'ev-tab-events':
+        events = store.get('events', [])
+        if not events:
+            if not TICKETMASTER_API_KEY:
+                return html.Div([
+                    html.Div("🔑 Add your free Ticketmaster API key to gsf.ini to see live events.",
+                             style={'color':'#443355','fontSize':'.65rem'}),
+                    html.Br(),
+                    html.Div("Meanwhile, check the 🏟 VENUES tab for event spaces in this area.",
+                             style={'color':'#5d2d8a','fontSize':'.63rem'}),
+                ], className='ev-empty')
+            return html.Div(
+                f"No upcoming events found within {centre.get('radius_km', 25)} km. "
+                "Try increasing the radius.",
+                className='ev-empty')
+
+        rows = []
+        current_date = None
+        for ev in events:
+            date_str = ev.get('date', '')
+            # Date separator
+            if date_str and date_str != current_date:
+                current_date = date_str
+                try:
+                    from datetime import datetime as _dt
+                    d = _dt.strptime(date_str, '%Y-%m-%d')
+                    date_display = d.strftime('%A, %d %b %Y')
+                except Exception:
+                    date_display = date_str
+                rows.append(html.Div(date_display, className='ev-section-hdr'))
+
+            status_code = ev.get('status', 'onsale')
+            status_map = {
+                'onsale': ('ON SALE','onsale'),
+                'offsale': ('OFF SALE','cancelled'),
+                'cancelled': ('CANCELLED','cancelled'),
+                'postponed': ('POSTPONED','postponed'),
+                'rescheduled': ('RESCHEDULED','postponed'),
+                'soldOut': ('SOLD OUT','sold-out'),
+            }
+            s_label, s_cls = status_map.get(status_code, (status_code.upper(), 'onsale'))
+
+            price_el = html.Span(ev['price'], className='ev-price') if ev.get('price') else html.Span()
+
+            url = ev.get('url', '')
+            name_el = (html.A(ev['name'], href=url, target='_blank', className='ev-name')
+                       if url else html.Span(ev['name'], className='ev-name'))
+
+            rows.append(html.Div([
+                html.Div([
+                    html.Span(ev['icon'] + ' ', style={'fontSize':'.85rem'}),
+                    name_el,
+                    html.Span(s_label, className=f'ev-badge {s_cls}'),
+                    price_el,
+                ], style={'display':'flex','alignItems':'baseline','flexWrap':'wrap','gap':'3px'}),
+                html.Div([
+                    html.Span(f"🕐 {ev['time']}  " if ev.get('time') and ev['time'] != 'TBA' else '🕐 TBA  ',
+                              style={'color':'#88aaff','fontSize':'.6rem'}),
+                    html.Span(f"📍 {ev['venue']}", style={'color':'#664488','fontSize':'.6rem'}),
+                    html.Span(f"  ·  {ev['city']}" if ev.get('city') else '',
+                              style={'color':'#443366','fontSize':'.6rem'}),
+                    html.Span(f"  ·  {ev['dist_km']} km away",
+                              style={'color':'#336644','fontSize':'.59rem'}),
+                ], className='ev-meta'),
+            ], className='ev-card'))
+
+        return html.Div(rows)
+
+    # ── Tab: Venues ───────────────────────────────────────────
+    elif active_tab == 'ev-tab-venues':
+        venues = store.get('venues', [])
+        if not venues:
+            return html.Div("No event venues found in this area via OpenStreetMap.",
+                            className='ev-empty')
+        rows = [html.Div("Event spaces, stadiums & cultural venues from OpenStreetMap",
+                         className='ev-section-hdr')]
+        for ve in venues:
+            url = ve.get('url', '')
+            name_el = (html.A(ve['name'], href=url, target='_blank', className='ev-name')
+                       if url else html.Span(ve['name'], className='ev-name'))
+            rows.append(html.Div([
+                html.Div([
+                    html.Span(ve['icon'] + ' ', style={'fontSize':'.85rem'}),
+                    name_el,
+                    html.Span('VENUE', className='ev-badge venue'),
+                ], style={'display':'flex','alignItems':'baseline','gap':'3px'}),
+                html.Div([
+                    html.Span(ve['category'] + '  ', style={'color':'#664488','fontSize':'.6rem'}),
+                    html.Span(f"📍 {ve['city']}" if ve.get('city') else '',
+                              style={'color':'#443366','fontSize':'.6rem'}),
+                    html.Span(f"  ·  {ve['dist_km']} km away",
+                              style={'color':'#336644','fontSize':'.59rem'}),
+                ], className='ev-meta'),
+            ], className='ev-card'))
+        return html.Div(rows)
+
+    # ── Tab: News Context ─────────────────────────────────────
+    else:
+        news = store.get('news', [])
+        if not news:
+            return html.Div([
+                html.Div("No recent GDELT news events found near this location.",
+                         style={'color':'#443355','fontSize':'.65rem','marginBottom':'6px'}),
+                html.Div("GDELT tracks global conflict, disaster, protest, and emergency news "
+                         "in near-real-time. A quiet area means no major incidents in the last 4 hours.",
+                         style={'color':'#332244','fontSize':'.62rem','lineHeight':'1.4'}),
+            ], className='ev-empty')
+
+        rows = [html.Div("Recent news events within this area (GDELT · last 4 hours)",
+                         className='ev-section-hdr')]
+        for item in news:
+            sentiment = item.get('sentiment', '🟡 Neutral')
+            url = item.get('url', '')
+            title_el = (html.A(item['title'], href=url, target='_blank',
+                               style={'color':'#ccaaff','textDecoration':'none'})
+                        if url else html.Span(item['title'], className='ev-news-title'))
+            rows.append(html.Div([
+                html.Div(title_el, className='ev-news-title'),
+                html.Div([
+                    html.Span(sentiment + '  ', style={'fontSize':'.6rem'}),
+                    html.Span(f"📰 {item['count']} articles  ",
+                              style={'color':'#664488','fontSize':'.59rem'}),
+                    html.Span(f"tone: {item['tone']:+.1f}  ",
+                              style={'color':'#443366','fontSize':'.59rem'}),
+                    html.Span(f"📍 {item['dist_km']} km away",
+                              style={'color':'#336644','fontSize':'.59rem'}),
+                ], className='ev-news-meta'),
+            ], className='ev-news-item'))
+        return html.Div(rows)
+
+
+# ── EVENT MARKERS ON TILE MAP  (added to cb_map via store-events) ──
+# cb_map already declared below; we patch it by adding store-events as Input.
+
+
+# ── PRIMARY: TILE MAP (Scattermapbox) ─────────────────────────
+# Fetches RainViewer radar path from cache and composes
+# all layers including POI, radar tiles, basemap, search centre.
+
 @app.callback(
     Output('map-fig','figure'),
     Input('store-snap','data'),
     Input('layer-toggles','value'),
     Input('store-pb','data'),
     Input('eq-days-slider','value'),
+    Input('store-basemap','data'),
+    Input('store-search','data'),
+    Input('store-poi','data'),
+    Input('store-events','data'),
 )
-def cb_map(snap, layers, pb_state, eq_days):
+def cb_map(snap, layers, pb_state, eq_days, basemap_style, search_state, poi_data, ev_store):
     if not snap: return go.Figure()
-    layers = layers or []; eq_days = eq_days or 1
-    pb = pb_state or {}; is_playback = not pb.get('live', True)
+    layers   = layers or []; eq_days = eq_days or 1
+    pb       = pb_state or {}; is_playback = not pb.get('live', True)
+    mapstyle = basemap_style or 'carto-darkmatter'
 
     def sdf(key):
-        try: return pd.DataFrame(snap.get(key,[]))
+        try: return pd.DataFrame(snap.get(key, []))
         except: return pd.DataFrame()
 
-    df_fl=sdf('flights'); df_fi=sdf('fires'); df_sh=sdf('ships')
-    df_aq=sdf('aq');      df_ev=sdf('events'); df_sl=sdf('starlink')
-    df_th=sdf('threat');  iss=snap.get('iss',{}) or {}
-    trails=snap.get('trails',{}) or {}
-    geofences=snap.get('geofences',{}) or _geofence.get_zones()
+    df_fl = sdf('flights'); df_fi = sdf('fires');  df_sh = sdf('ships')
+    df_aq = sdf('aq');      df_ev = sdf('events'); df_sl = sdf('starlink')
+    df_th = sdf('threat');  iss   = snap.get('iss', {}) or {}
+    trails    = snap.get('trails', {}) or {}
+    geofences = snap.get('geofences', {}) or _geofence.get_zones()
 
-    # EQ source: live or 30d
     if eq_days <= 1:
         df_eq = sdf('quakes')
     else:
         df_30 = _cache.get_quakes_30d()
         if df_30.empty: df_eq = sdf('quakes')
         else:
-            cutoff_ms = (datetime.utcnow()-timedelta(days=eq_days)).timestamp()*1000
+            cutoff_ms = (datetime.utcnow() - timedelta(days=eq_days)).timestamp() * 1000
             df_eq = df_30[df_30['time_ms'] >= cutoff_ms].head(MAX_EQ)
 
     traces = []
 
-    # ── Flight trails (polylines) ──────────────────────────
+    # ── Flight trails ──────────────────────────────────────────
     if 'trails' in layers and trails:
-        lons_t=[]; lats_t=[]
-        for trail_pts in list(trails.values()):
-            if len(trail_pts) < 2: continue
-            for p in trail_pts: lons_t.append(p[0]); lats_t.append(p[1])
-            lons_t.append(None); lats_t.append(None)  # separator
+        lons_t = []; lats_t = []
+        for pts in trails.values():
+            if len(pts) < 2: continue
+            for p in pts: lons_t.append(p[0]); lats_t.append(p[1])
+            lons_t.append(None); lats_t.append(None)
         if lons_t:
             traces.append(go.Scattermapbox(
                 lon=lons_t, lat=lats_t, mode='lines',
                 line=dict(color='rgba(0,200,130,0.35)', width=1.5),
-                hoverinfo='skip', name='Trails', showlegend=False,
-            ))
+                hoverinfo='skip', name='Trails', showlegend=False))
 
-    # ── Flights ────────────────────────────────────────────
+    # ── Flights ────────────────────────────────────────────────
     if 'flights' in layers and not df_fl.empty:
-        # Colour by altitude 0–13 km → teal gradient
-        alt_norm = (df_fl['alt'].clip(0,13000)/13000).tolist()
-        colors = [f"rgba({int(0)},{int(55+n*200)},{int(30+n*195)},0.85)" for n in alt_norm]
         traces.append(go.Scattermapbox(
-            lon=df_fl['lon'], lat=df_fl['lat'],
-            mode='markers',
+            lon=df_fl['lon'], lat=df_fl['lat'], mode='markers',
             marker=dict(size=7, color=df_fl['alt'].tolist(),
-                        colorscale=[[0,'rgba(0,55,30,0.8)'],[0.4,'rgba(0,140,80,0.85)'],[1,'rgba(0,255,220,0.9)']],
+                        colorscale=[[0,'rgba(0,55,30,0.8)'],[.4,'rgba(0,140,80,0.85)'],[1,'rgba(0,255,220,0.9)']],
                         cmin=0, cmax=13000, opacity=0.9,
-                        colorbar=dict(title=dict(text='Alt (m)',font=dict(color='#a0ffcc',size=8)),
-                                      thickness=7, len=0.25, x=1.01,
-                                      tickfont=dict(color='#a0ffcc',size=7),bgcolor='rgba(0,0,0,0)',bordercolor='#0d3320')),
+                        colorbar=dict(title=dict(text='Alt(m)',font=dict(color='#a0ffcc',size=8)),
+                                      thickness=7,len=0.25,x=1.01,
+                                      tickfont=dict(color='#a0ffcc',size=7),
+                                      bgcolor='rgba(0,0,0,0)',bordercolor='#0d3320')),
             text="<b>✈ "+df_fl['callsign']+"</b><br>"+df_fl['country']+"<br>↑"+df_fl['alt'].astype(int).astype(str)+"m  "+df_fl['vel'].astype(str)+"m/s",
-            hoverinfo='text',
-            name=f"✈ Aircraft ({len(df_fl)})",
+            hoverinfo='text', name=f"✈ Aircraft ({len(df_fl)})",
             customdata=df_fl[['icao','callsign','country','alt','vel','hdg']].values,
         ))
 
-    # ── Earthquakes ────────────────────────────────────────
+    # ── Earthquakes ────────────────────────────────────────────
     if 'quakes' in layers and not df_eq.empty:
-        sizes = (df_eq['mag'].clip(2,8) * 3.5).tolist()
+        mag_sz = (df_eq['mag'].clip(2, 8) * 3.5).tolist()
         traces.append(go.Scattermapbox(
             lon=df_eq['lon'], lat=df_eq['lat'], mode='markers',
-            marker=dict(size=sizes, color=df_eq['mag'].tolist(),
-                        colorscale=[[0,'rgba(42,8,0,0.8)'],[0.5,'rgba(200,68,0,0.85)'],[1,'rgba(255,17,0,0.9)']],
-                        cmin=2.5, cmax=7.5, opacity=0.85),
-            text="<b>⚡ M"+df_eq['mag'].round(1).astype(str)+"</b><br>"+df_eq['place']+"<br>↓"+df_eq['depth'].astype(str)+"km",
-            hoverinfo='text',
-            name=f"⚡ Earthquakes ({len(df_eq)})",
+            marker=dict(size=mag_sz, color=df_eq['mag'].tolist(),
+                        colorscale=[[0,'rgba(80,10,0,0.75)'],[.5,'rgba(220,60,0,0.85)'],[1,'rgba(255,230,0,0.95)']],
+                        cmin=2.5, cmax=7.5, opacity=0.9),
+            text="<b>⚡ M"+df_eq['mag'].round(1).astype(str)+"</b><br>"+df_eq['place']+"<br>↓"+df_eq['depth'].astype(str)+"km  "+df_eq['time'],
+            hoverinfo='text', name=f"⚡ Earthquakes ({len(df_eq)})",
             customdata=df_eq[['mag','place','depth','time']].values,
         ))
 
-    # ── Fires ──────────────────────────────────────────────
+    # ── Fires ──────────────────────────────────────────────────
     if 'fires' in layers and not df_fi.empty:
         traces.append(go.Scattermapbox(
             lon=df_fi['lon'], lat=df_fi['lat'], mode='markers',
-            marker=dict(size=6, color=df_fi['brightness'].tolist(),
-                        colorscale=[[0,'rgba(51,0,0,0.7)'],[0.5,'rgba(255,68,0,0.8)'],[1,'rgba(255,220,0,0.9)']],
-                        cmin=300, cmax=500, opacity=0.8),
-            text="<b>🔥 Fire</b><br>Brightness: "+df_fi['brightness'].round(1).astype(str)+" K<br>FRP: "+df_fi['power'].astype(str)+" MW",
-            hoverinfo='text',
-            name=f"🔥 Fires ({len(df_fi)})",
+            marker=dict(size=5, color=df_fi['brightness'].tolist(),
+                        colorscale=[[0,'rgba(80,20,0,0.7)'],[.5,'rgba(255,80,0,0.85)'],[1,'rgba(255,230,0,0.95)']],
+                        cmin=300, cmax=500, opacity=0.85),
+            text="<b>🔥 Fire</b><br>"+df_fi['brightness'].round(1).astype(str)+" K  FRP: "+df_fi['power'].astype(str)+" MW",
+            hoverinfo='text', name=f"🔥 Fires ({len(df_fi)})",
         ))
 
-    # ── Ships ──────────────────────────────────────────────
+    # ── Ships ──────────────────────────────────────────────────
     if 'ships' in layers and not df_sh.empty and 'lon' in df_sh.columns:
         traces.append(go.Scattermapbox(
             lon=df_sh['lon'], lat=df_sh['lat'], mode='markers',
-            marker=dict(size=8, color='rgba(0,200,255,0.85)'),
+            marker=dict(size=8, color='rgba(0,200,255,0.85)',
+                        symbol='harbor'),
             text="<b>🚢 "+df_sh['name']+"</b><br>MMSI: "+df_sh['mmsi'].astype(str)+"<br>"+df_sh['sog'].astype(str)+" kn",
-            hoverinfo='text',
-            name=f"🚢 Ships ({len(df_sh)})",
-            customdata=df_sh[['mmsi','name','sog','cog']].values if all(c in df_sh.columns for c in ['mmsi','name','sog','cog']) else None,
+            hoverinfo='text', name=f"🚢 Ships ({len(df_sh)})",
+            customdata=df_sh[['mmsi','name','sog','cog']].values
+                       if all(c in df_sh.columns for c in ['mmsi','name','sog','cog']) else None,
         ))
 
-    # ── Starlink ───────────────────────────────────────────
+    # ── Starlink ───────────────────────────────────────────────
     if 'starlink' in layers and not df_sl.empty and 'lon' in df_sl.columns:
         traces.append(go.Scattermapbox(
             lon=df_sl['lon'], lat=df_sl['lat'], mode='markers',
-            marker=dict(size=5, color='rgba(170,170,255,0.75)'),
-            text="<b>🛰 "+df_sl['name']+"</b><br>"+df_sl['alt_km'].astype(str)+" km",
-            hoverinfo='text',
-            name=f"🛰 Starlink ({len(df_sl)})",
-            customdata=df_sl[['name','norad','alt_km']].values if all(c in df_sl.columns for c in ['name','norad','alt_km']) else None,
+            marker=dict(size=5, color='rgba(170,170,255,0.7)'),
+            text="<b>🛰 "+df_sl['name']+"</b><br>Alt: "+df_sl['alt_km'].astype(str)+" km",
+            hoverinfo='text', name=f"🛰 Starlink ({len(df_sl)})",
+            customdata=df_sl[['name','norad','alt_km']].values
+                       if all(c in df_sl.columns for c in ['name','norad','alt_km']) else None,
         ))
 
-    # ── ISS ────────────────────────────────────────────────
+    # ── ISS ────────────────────────────────────────────────────
     if 'iss' in layers and iss and iss.get('lat') is not None:
-        # Orbital trail
-        it = snap.get('iss_trail',[])
-        if it and len(it) >= 2:
-            traces.append(go.Scattermapbox(
-                lon=[p[0] for p in it], lat=[p[1] for p in it], mode='lines',
-                line=dict(color='rgba(255,238,68,0.4)', width=2),
-                hoverinfo='skip', name='ISS Trail', showlegend=False,
-            ))
         traces.append(go.Scattermapbox(
             lon=[iss['lon']], lat=[iss['lat']], mode='markers+text',
-            marker=dict(size=14, color='rgba(255,238,68,0.95)'),
-            text=['🛸'], textposition='top center',
-            textfont=dict(size=18, color='rgba(255,238,68,0.9)'),
+            marker=dict(size=16, color='rgba(255,238,68,0.95)'),
+            text=["🛸"], textposition='top center',
+            textfont=dict(size=14),
             hovertext=f"<b>🛸 ISS</b><br>Alt: {iss.get('alt_km','—')} km<br>Vel: {int(iss.get('vel_kph',0)):,} km/h<br>Vis: {iss.get('vis','—')}",
-            hoverinfo='text',
-            name="🛸 ISS",
+            hoverinfo='text', name="🛸 ISS",
         ))
 
-    # ── Air Quality ────────────────────────────────────────
+    # ── Air Quality ────────────────────────────────────────────
     if 'aq' in layers and not df_aq.empty and 'lon' in df_aq.columns:
         traces.append(go.Scattermapbox(
             lon=df_aq['lon'], lat=df_aq['lat'], mode='markers',
             marker=dict(size=9, color=df_aq['pm25'].tolist(),
-                        colorscale=[[0,'rgba(0,228,0,0.8)'],[0.25,'rgba(255,255,0,0.8)'],[0.5,'rgba(255,126,0,0.8)'],[0.75,'rgba(255,0,0,0.85)'],[1,'rgba(126,0,35,0.9)']],
-                        cmin=0, cmax=150, opacity=0.85),
+                        colorscale=[[0,'rgba(0,228,0,0.8)'],[.25,'rgba(255,255,0,0.8)'],
+                                    [.5,'rgba(255,126,0,0.85)'],[.75,'rgba(255,0,0,0.9)'],[1,'rgba(126,0,35,0.9)']],
+                        cmin=0, cmax=150, opacity=0.88),
             text="<b>💨 "+df_aq['name']+"</b><br>PM2.5: "+df_aq['pm25'].astype(str)+" µg/m³<br>"+df_aq['label'],
-            hoverinfo='text',
-            name=f"💨 Air Quality ({len(df_aq)})",
-            customdata=df_aq[['pm25','label','name','country']].values if all(c in df_aq.columns for c in ['pm25','label','name','country']) else None,
+            hoverinfo='text', name=f"💨 Air Quality ({len(df_aq)})",
+            customdata=df_aq[['pm25','label','name','country']].values
+                       if all(c in df_aq.columns for c in ['pm25','label','name','country']) else None,
         ))
 
-    # ── GDELT Events ───────────────────────────────────────
+    # ── GDELT Events ───────────────────────────────────────────
     if 'events' in layers and not df_ev.empty and 'lon' in df_ev.columns:
         traces.append(go.Scattermapbox(
             lon=df_ev['lon'], lat=df_ev['lat'], mode='markers',
-            marker=dict(size=(df_ev['count'].clip(1,10)/1.5+5).tolist(),
+            marker=dict(size=(df_ev['count'].clip(1, 10) / 1.5 + 5).tolist(),
                         color=df_ev['tone'].tolist(),
-                        colorscale=[[0,'rgba(255,0,68,0.8)'],[0.5,'rgba(136,68,34,0.75)'],[1,'rgba(68,100,68,0.7)']],
+                        colorscale=[[0,'rgba(255,0,68,0.8)'],[.5,'rgba(136,68,34,0.75)'],[1,'rgba(68,100,68,0.7)']],
                         cmin=-20, cmax=5, opacity=0.8),
             text="<b>📰 "+df_ev['title'].str[:55]+"</b><br>"+df_ev['count'].astype(str)+" articles",
-            hoverinfo='text',
-            name=f"📰 Events ({len(df_ev)})",
-            customdata=df_ev[['title','count','tone']].values if all(c in df_ev.columns for c in ['title','count','tone']) else None,
+            hoverinfo='text', name=f"📰 Events ({len(df_ev)})",
+            customdata=df_ev[['title','count','tone']].values
+                       if all(c in df_ev.columns for c in ['title','count','tone']) else None,
         ))
 
-    # ── Threat zones (circles, coloured by score) ─────────
+    # ── Threat zones ───────────────────────────────────────────
     if 'threat' in layers and not df_th.empty and 'lon_bin' in df_th.columns:
         traces.append(go.Scattermapbox(
             lon=df_th['lon_bin'], lat=df_th['lat_bin'], mode='markers',
-            marker=dict(size=(df_th['score'].clip(0,100)/7+8).tolist(),
+            marker=dict(size=(df_th['score'].clip(0, 100) / 7 + 8).tolist(),
                         color=df_th['score'].tolist(),
-                        colorscale=[[0,'rgba(0,51,0,0.4)'],[0.4,'rgba(136,102,0,0.55)'],[0.7,'rgba(255,68,0,0.65)'],[1,'rgba(255,0,0,0.75)']],
+                        colorscale=[[0,'rgba(0,51,0,0.4)'],[.4,'rgba(136,102,0,0.55)'],
+                                    [.7,'rgba(255,68,0,0.65)'],[1,'rgba(255,0,0,0.75)']],
                         cmin=0, cmax=100, opacity=0.7),
             text="<b>🎯 Threat Zone</b><br>Score: "+df_th['score'].round(1).astype(str)+" / 100",
-            hoverinfo='text',
-            name=f"🎯 Threat ({len(df_th)})",
+            hoverinfo='text', name=f"🎯 Threat ({len(df_th)})",
         ))
 
-    # ── Geofence zones (polygon outlines) ─────────────────
+    # ── Geofence polygon outlines ──────────────────────────────
     if 'geofence' in layers and geofences:
         for zone_name, z in geofences.items():
-            # Draw bounding box as closed polygon
             lats_z = [z['lat_min'],z['lat_min'],z['lat_max'],z['lat_max'],z['lat_min']]
             lons_z = [z['lon_min'],z['lon_max'],z['lon_max'],z['lon_min'],z['lon_min']]
             traces.append(go.Scattermapbox(
                 lon=lons_z, lat=lats_z, mode='lines',
-                line=dict(color='rgba(0,255,68,0.7)', width=2),
+                line=dict(color='rgba(0,255,68,0.75)', width=2),
                 fill='toself', fillcolor='rgba(0,255,68,0.05)',
                 hoverinfo='text',
-                text=f"<b>🔲 {zone_name}</b><br>{z['lat_min']:.1f}–{z['lat_max']:.1f}°N  {z['lon_min']:.1f}–{z['lon_max']:.1f}°E",
-                name=f"🔲 {zone_name}",
+                text=f"<b>🔲 {zone_name}</b><br>{z['lat_min']:.2f}–{z['lat_max']:.2f}°N  {z['lon_min']:.2f}–{z['lon_max']:.2f}°E",
+                name=f"🔲 {zone_name}", showlegend=True,
+            ))
+
+    # ── POI layer ──────────────────────────────────────────────
+    if 'poi' in layers and poi_data:
+        try:
+            df_poi = pd.DataFrame(poi_data)
+            if not df_poi.empty and 'lon' in df_poi.columns:
+                # Group by category color for cleaner rendering
+                for cat_color in df_poi['color'].unique():
+                    subset = df_poi[df_poi['color'] == cat_color]
+                    traces.append(go.Scattermapbox(
+                        lon=subset['lon'], lat=subset['lat'], mode='markers+text',
+                        marker=dict(size=11, color=cat_color, opacity=0.85),
+                        text=subset['icon'].tolist(),
+                        textposition='middle center',
+                        textfont=dict(size=9),
+                        hovertext="<b>"+subset['icon']+" "+subset['name']+"</b><br>"+subset['category'],
+                        hoverinfo='text',
+                        name=f"🏙 POI ({len(df_poi)} total)" if cat_color == df_poi['color'].iloc[0] else None,
+                        showlegend=(cat_color == df_poi['color'].iloc[0]),
+                    ))
+        except Exception as e:
+            print(f"[POI render] {e}")
+
+    # ── Event markers (Ticketmaster + OSM venues) ──────────────
+    ev_store_data = ev_store or {}
+    ev_centre     = ev_store_data.get('centre', {})
+    if ev_centre:
+        # Live Ticketmaster events
+        tm_evs = ev_store_data.get('events', [])
+        if tm_evs:
+            ev_df = pd.DataFrame(tm_evs)
+            ev_df = ev_df.dropna(subset=['lat','lon'])
+            if not ev_df.empty:
+                traces.append(go.Scattermapbox(
+                    lon=ev_df['lon'], lat=ev_df['lat'],
+                    mode='markers+text',
+                    marker=dict(size=14, color='rgba(200,120,255,0.92)',
+                                symbol='circle'),
+                    text=ev_df['icon'].tolist(),
+                    textposition='middle center',
+                    textfont=dict(size=10),
+                    hovertext=(
+                        "<b>" + ev_df['icon'] + " " + ev_df['name'] + "</b><br>" +
+                        ev_df['date'] + "  " + ev_df['time'] + "<br>" +
+                        "📍 " + ev_df['venue'] + "<br>" +
+                        ev_df['dist_km'].astype(str) + " km away" +
+                        ev_df['price'].apply(lambda p: f"<br>💰 {p}" if p else "")
+                    ).tolist(),
+                    hoverinfo='text',
+                    name=f"🎫 Events ({len(ev_df)})",
+                    customdata=ev_df[['name','date','venue','dist_km']].values,
+                ))
+
+        # OSM Venues
+        osm_vs = ev_store_data.get('venues', [])
+        if osm_vs:
+            vs_df = pd.DataFrame(osm_vs)
+            vs_df = vs_df.dropna(subset=['lat','lon'])
+            if not vs_df.empty:
+                traces.append(go.Scattermapbox(
+                    lon=vs_df['lon'], lat=vs_df['lat'],
+                    mode='markers+text',
+                    marker=dict(size=11, color='rgba(68,136,255,0.82)',
+                                symbol='circle'),
+                    text=vs_df['icon'].tolist(),
+                    textposition='middle center',
+                    textfont=dict(size=9),
+                    hovertext=(
+                        "<b>" + vs_df['icon'] + " " + vs_df['name'] + "</b><br>" +
+                        vs_df['category'] + "<br>" +
+                        vs_df['dist_km'].astype(str) + " km away"
+                    ).tolist(),
+                    hoverinfo='text',
+                    name=f"🏟 Venues ({len(vs_df)})",
+                ))
+
+        # Draw search-radius circle hint as a faint polygon
+        if ev_centre.get('lat') and ev_centre.get('radius_km'):
+            c_lat = ev_centre['lat']; c_lon = ev_centre['lon']
+            r_km  = ev_centre['radius_km']
+            # Approximate circle with 36-point polygon
+            import math as _m
+            R_earth = 6371.0
+            circle_lats = []; circle_lons = []
+            for deg in range(0, 361, 10):
+                θ = _m.radians(deg)
+                dlat = (r_km / R_earth) * _m.cos(θ)
+                dlon = (r_km / R_earth) * _m.sin(θ) / _m.cos(_m.radians(c_lat))
+                circle_lats.append(c_lat + _m.degrees(dlat))
+                circle_lons.append(c_lon + _m.degrees(dlon))
+            traces.append(go.Scattermapbox(
+                lon=circle_lons, lat=circle_lats,
+                mode='lines',
+                line=dict(color='rgba(180,100,255,0.30)', width=1.5),
+                fill='toself', fillcolor='rgba(180,100,255,0.04)',
+                hoverinfo='skip',
+                name=f"Event search radius ({r_km} km)",
                 showlegend=True,
             ))
 
-    ts_label = (snap.get('ts',''))[11:19]+' UTC' if snap.get('ts') else datetime.utcnow().strftime('%H:%M:%S UTC')
-    pb_label  = f"  ⏪ PLAYBACK {ts_label}" if is_playback else f"  ●  {ts_label}"
+    # ── Map layout ─────────────────────────────────────────────
+    ts_label = (snap.get('ts', ''))[11:19] + ' UTC' if snap.get('ts') else datetime.utcnow().strftime('%H:%M:%S UTC')
+    pb_label = f"  ⏪ PLAYBACK {ts_label}" if is_playback else f"  ●  {ts_label}"
+
+    # Search-driven center (if available, override default)
+    s = search_state or {}
+    center_lat = s.get('lat', 20.0)
+    center_lon = s.get('lon',  0.0)
+    zoom_level = s.get('zoom', 1.5)
+
+    # If an event search was done, zoom to that area
+    if ev_centre.get('lat') and ev_centre.get('lon'):
+        r_km = ev_centre.get('radius_km', 25)
+        center_lat = ev_centre['lat']
+        center_lon = ev_centre['lon']
+        # Pick zoom level based on radius
+        if r_km <= 5:    zoom_level = 13
+        elif r_km <= 15: zoom_level = 11
+        elif r_km <= 25: zoom_level = 10
+        elif r_km <= 50: zoom_level = 9
+        else:            zoom_level = 8
+
+    # Radar tiles as mapbox layer
+    mapbox_layers = []
+    if 'radar' in layers:
+        radar_path = _cache.get_radar_path()
+        if radar_path:
+            mapbox_layers.append({
+                'sourcetype': 'raster',
+                'source': [f"https://tilecache.rainviewer.com{radar_path}/256/{{z}}/{{x}}/{{y}}/2/1_1.png"],
+                'opacity': 0.45,
+                'type': 'raster',
+                'tileSize': 256,
+            })
 
     fig = go.Figure(data=traces)
     fig.update_layout(
         mapbox=dict(
-            style='carto-darkmatter',
-            center=dict(lat=20, lon=0),
-            zoom=1.5,
-            uirevision='gsf-map',   # ← preserves zoom/pan between data updates
+            style=mapstyle,
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom_level,
+            uirevision='gsf-map',
+            layers=mapbox_layers,
         ),
         title=dict(
             text=f"◈ GSF LIVE MAP{pb_label}",
@@ -1867,11 +2906,11 @@ def cb_map(snap, layers, pb_state, eq_days):
         margin=dict(l=0, r=0, t=28, b=0),
         showlegend=True,
         legend=dict(bgcolor='rgba(0,18,8,0.85)', bordercolor='#0d3320', borderwidth=1,
-                    font=dict(size=7, color='#a0ffcc'), x=0.01, y=0.01,
-                    orientation='v'),
+                    font=dict(size=7, color='#a0ffcc'), x=0.01, y=0.01, orientation='v'),
         uirevision='gsf-map',
     )
     return fig
+
 
 # ── SECONDARY: GLOBE (Scattergeo) ────────────────────────────
 @app.callback(
