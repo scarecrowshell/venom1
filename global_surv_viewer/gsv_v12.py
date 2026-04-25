@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════╗
-║   GEO-SURVEILLANCE FEED  ·  VERSION 1.1  — INTERACTIVE   ║
+║   GEO-SURVEILLANCE VIEWER  ·  VERSION 1.1  — INTERACTIVE   ║
 ║   Global Vision Platform — Public OSINT Edition           ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  ARCHITECTURE CHANGE:                                     ║
