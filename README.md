@@ -7,7 +7,7 @@ Venom1 functions as a distributed, policy-enforced sensor fusion and event attes
 ## Constituent Subsystems
 
 - Global Surveillance Viewer
-- Interior Mapping Scanner
+- Thermal/Sonar/Machine Vision Imaging software
 
 ## Comprehensive Capabilities
 
