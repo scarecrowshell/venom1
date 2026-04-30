@@ -1,4 +1,4 @@
-# Geo-Surveillance Viewer (GSV)
+# Geo-Surveillance Viewer (GSV) Elendil
 
 A live, multi-layer geospatial intelligence dashboard built with Dash, Plotly, and Flask. It combines public data feeds into a single interactive map and supporting panels for tracking aircraft, earthquakes, fires, ships, the ISS, air quality, news events, geofences, anomalies, and threat hotspots.
 
